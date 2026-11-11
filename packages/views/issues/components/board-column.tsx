@@ -2,9 +2,22 @@
 
 import { memo, useCallback, useMemo, useState, type ReactNode } from "react";
 import { Virtuoso } from "react-virtuoso";
-import { EyeOff, FolderMinus, MoreHorizontal, Plus, UserMinus } from "lucide-react";
+import {
+  Ban,
+  ChevronDown,
+  ChevronRight,
+  EyeOff,
+  FolderMinus,
+  MoreHorizontal,
+  Plus,
+  UserMinus,
+} from "@multica/ui/icons";
 import { useDroppable } from "@dnd-kit/core";
-import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+  type SortingStrategy,
+} from "@dnd-kit/sortable";
 import type {
   Issue,
   IssueAssigneeType,
@@ -18,9 +31,10 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from "@multica/ui/components/ui/dropdown-menu";
+import { TruncatedTooltip } from "@multica/ui/components/common/truncated-tooltip";
 import { useWorkspaceId } from "@multica/core/hooks";
+import { useWorkspacePaths } from "@multica/core/paths";
 import { useIssueStatuses } from "@multica/core/issue-statuses/hooks";
-import { STATUS_CONFIG } from "@multica/core/issues/config";
 import { useViewStoreApi } from "@multica/core/issues/stores/view-store-context";
 import { useViewBaseline } from "../surface/view-baseline-context";
 import { StatusHeading } from "./status-heading";
@@ -33,7 +47,17 @@ import { useRestoredScrollOffset, useRestoredScrollRef } from "../../platform";
 import { DeferredPopup } from "../../common/deferred-popup";
 import { DeferredTooltip } from "../../common/deferred-tooltip";
 import { VirtuosoSeed } from "../../common/virtuoso-seed";
+import { AppLink } from "../../navigation";
+import { useBoardWorkflow } from "./board-workflow-context";
+import { ColumnHandoff } from "../../workflows/column-handoff";
 import type { IssueCreateDefaults } from "../surface/types";
+import {
+  buildBoardColumnTree,
+  nodeIssueId,
+  visibleTreeIssueIds,
+  type BoardTreeNode,
+  type ParentLookup,
+} from "../utils/board-hierarchy";
 
 // Insertion-position prediction intentionally omitted. The server's
 // ORDER BY uses PostgreSQL's en_US.utf8 collation (glibc), which
@@ -96,6 +120,22 @@ export interface BoardColumnGroup {
   createData?: IssueCreateDefaults;
 }
 
+/** Sub-issue nesting for a board column; omitted when nesting is off. */
+export interface BoardColumnHierarchy {
+  collapsed: ReadonlySet<string>;
+  onToggle: (issueId: string) => void;
+  /** Resolves a parent that sits outside this column, for its ghost header. */
+  lookupParent: ParentLookup;
+}
+
+// Nested cards are not one vertical list, so list-shift animations would move
+// the wrong cards. With nesting on, cards stay put while dragging; the drop
+// target still resolves normally.
+const noShiftStrategy: SortingStrategy = () => null;
+
+// Past this depth sub-issues stop indenting so a 280px column stays readable.
+const MAX_INDENT_DEPTH = 3;
+
 export const BoardColumn = memo(function BoardColumn({
   group,
   issueIds,
@@ -107,6 +147,7 @@ export const BoardColumn = memo(function BoardColumn({
   projectId,
   onCreateIssue,
   sortLabel,
+  hierarchy,
 }: {
   group: BoardColumnGroup;
   issueIds: string[];
@@ -119,29 +160,44 @@ export const BoardColumn = memo(function BoardColumn({
   projectId?: string;
   onCreateIssue?: (defaults: IssueCreateDefaults) => void;
   sortLabel?: string | null;
+  hierarchy?: BoardColumnHierarchy;
 }) {
   const status = group.status;
   const wsId = useWorkspaceId();
-  const { categoryOf, entryOf } = useIssueStatuses(wsId);
+  const { entryOf } = useIssueStatuses(wsId);
   const archived = !!status && !!entryOf(status)?.archived_at;
-  const cfg = status ? STATUS_CONFIG[categoryOf(status)] : null;
   const { setNodeRef, isOver: droppableIsOver } = useDroppable({ id: group.id });
-  const isOver = droppableIsOver && !archived;
+  // A dragged card whose project workflow does not list this status cannot
+  // land here; the column dims and says why. (MUL-7420)
+  const { dropBlockedReason, dropHint } = useBoardWorkflow();
+  const blockedReason = status ? dropBlockedReason(status) : null;
+  const isOver = droppableIsOver && !archived && !blockedReason;
+  const hint = isOver && status ? dropHint(status) : null;
   const viewStoreApi = useViewStoreApi();
   // A status fixed by the open saved view cannot be hidden from the board —
   // that would silently strip one of the view's own conditions.
   const viewBaseline = useViewBaseline();
   const statusFixedByView = !!status && viewBaseline?.status.has(status) === true;
   const { t } = useT("issues");
+  const { t: tCommon } = useT("common");
 
-  // Resolve IDs to Issue objects, preserving parent-provided order
-  const resolvedIssues = useMemo(
+  // Resolve IDs to top-level nodes. Without nesting this preserves the
+  // parent-provided order; with nesting sub-issues render inside their parent.
+  const entries = useMemo<BoardTreeNode[]>(
     () =>
-      issueIds.flatMap((id) => {
-        const issue = issueMap.get(id);
-        return issue ? [issue] : [];
-      }),
-    [issueIds, issueMap],
+      hierarchy
+        ? buildBoardColumnTree(issueIds, issueMap, hierarchy.lookupParent)
+        : issueIds.flatMap((id): BoardTreeNode[] => {
+            const issue = issueMap.get(id);
+            return issue
+              ? [{ kind: "issue", key: id, issue, children: [], descendantCount: 0 }]
+              : [];
+          }),
+    [hierarchy, issueIds, issueMap],
+  );
+  const sortableIds = useMemo(
+    () => visibleTreeIssueIds(entries, hierarchy?.collapsed ?? EMPTY_SET),
+    [entries, hierarchy],
   );
 
   // The column's scroll container is both dnd-kit's droppable and Virtuoso's
@@ -174,30 +230,51 @@ export const BoardColumn = memo(function BoardColumn({
     [footer],
   );
 
-  const computeItemKey = (_index: number, issue: Issue) => issue.id;
-  const itemContent = (index: number, issue: Issue) => (
+  const computeItemKey = (_index: number, node: BoardTreeNode) => node.key;
+  const itemContent = (index: number, node: BoardTreeNode) => (
     // pt-2 on every card but the first reproduces the previous `space-y-2`
     // gap; padding (not margin) is inside Virtuoso's measured item box so its
     // height math stays correct.
     <div className={index === 0 ? undefined : "pt-2"}>
-      <DraggableBoardCard
-        issue={issue}
-        childProgress={childProgressMap?.get(issue.id)}
-        project={
-          issue.project_id ? projectMap?.get(issue.project_id) : undefined
-        }
-        disableSorting={!!sortLabel}
+      <BoardTreeItem
+        node={node}
+        depth={0}
+        childProgressMap={childProgressMap}
+        projectMap={projectMap}
+        projectId={projectId}
+        sortLabel={sortLabel}
+        hierarchy={hierarchy}
       />
     </div>
   );
 
   return (
-    <div style={{ width: BOARD_COL_WIDTH }} className={`flex shrink-0 flex-col rounded-xl ${cfg?.columnBg ?? "bg-muted/40"} p-2`}>
-      <div className="mb-2 flex items-center justify-between px-1.5">
+    <div
+      data-mc="board-column"
+      style={{ width: BOARD_COL_WIDTH }}
+      className={`group/column relative flex shrink-0 flex-col rounded-board-column bg-board-column p-2 ${
+        hint ? "ring-2 ring-brand/30" : ""
+      }`}
+    >
+      {/* A dragged card whose workflow lacks this status cannot land here: the
+          column is hatched over and says why. (MUL-7420) */}
+      {blockedReason && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-xl bg-background/60 bg-[repeating-linear-gradient(135deg,transparent_0_8px,var(--color-border)_8px_9px)]"
+        >
+          <span className="flex items-center gap-1.5 rounded-md border border-surface-border bg-card px-2.5 py-1 text-caption text-muted-foreground shadow-sm">
+            <Ban className="size-3" />
+            {blockedReason}
+          </span>
+        </div>
+      )}
+      <div className="mb-2 flex items-center justify-between gap-2 px-1.5">
         <BoardGroupHeading group={group} count={totalCount ?? issueIds.length} />
 
-        {/* Right: add + menu */}
-        <div className="flex items-center gap-1">
+        {/* Right: step handler + add + menu */}
+        <div className="flex min-w-0 items-center gap-1">
+          {status && <WorkflowStepHandlerBadge status={status} />}
           {/* Column-header popups mount lazily: a board/swimlane renders one
               header per column and almost none of these menus/tooltips are
               ever opened — eagerly mounting them dominated surface mount
@@ -205,19 +282,35 @@ export const BoardColumn = memo(function BoardColumn({
           {status && (
             <DeferredPopup
               ariaHasPopup="menu"
+              tooltip={tCommon(($) => $.more_actions)}
               triggerRender={
-                <Button variant="ghost" size="icon-sm" className="rounded-full text-muted-foreground">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  className="text-muted-foreground"
+                  aria-label={tCommon(($) => $.more_actions)}
+                >
                   <MoreHorizontal className="size-3.5" />
                 </Button>
               }
             >
               {(open, onOpenChange) => (
                 <DropdownMenu open={open} onOpenChange={onOpenChange}>
-                  <DropdownMenuTrigger
-                    render={
-                      <Button variant="ghost" size="icon-sm" className="rounded-full text-muted-foreground">
-                        <MoreHorizontal className="size-3.5" />
-                      </Button>
+                  <DeferredTooltip
+                    content={tCommon(($) => $.more_actions)}
+                    trigger={
+                      <DropdownMenuTrigger
+                        render={
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            className="text-muted-foreground"
+                            aria-label={tCommon(($) => $.more_actions)}
+                          >
+                            <MoreHorizontal className="size-3.5" />
+                          </Button>
+                        }
+                      />
                     }
                   />
                   <DropdownMenuContent align="end">
@@ -241,7 +334,8 @@ export const BoardColumn = memo(function BoardColumn({
                 <Button
                   variant="ghost"
                   size="icon-sm"
-                  className="rounded-full text-muted-foreground"
+                  className="text-muted-foreground"
+                  aria-label={t(($) => $.board.add_issue_tooltip)}
                   onClick={() => {
                     const data = {
                       ...(group.createData ?? {}),
@@ -258,6 +352,16 @@ export const BoardColumn = memo(function BoardColumn({
         </div>
       </div>
       <div className="relative min-h-[200px] flex-1 rounded-lg">
+        {hint && (
+          <div className="pointer-events-none absolute inset-x-1 bottom-1 z-10 flex items-center justify-center gap-1.5 rounded-lg border border-dashed border-brand/50 bg-card px-3 py-3 text-caption text-muted-foreground shadow-sm">
+            {hint.actor && <ActorAvatar actorType={hint.actor.type} actorId={hint.actor.id} size="xs" profileLink={false} />}
+            <span className="truncate">
+              {hint.run
+                ? t(($) => $.workflows.board.drop_hint_run, { name: hint.name })
+                : t(($) => $.workflows.board.drop_hint, { name: hint.name })}
+            </span>
+          </div>
+        )}
         {isOver && sortLabel && (
           <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-background/40">
             <span className="rounded-md bg-popover px-2.5 py-1 text-caption font-medium text-popover-foreground shadow-sm border border-border">
@@ -279,9 +383,12 @@ export const BoardColumn = memo(function BoardColumn({
                 : ""
           }`}
         >
-          {resolvedIssues.length > 0 ? (
-            <SortableContext items={issueIds} strategy={verticalListSortingStrategy}>
-              {resolvedIssues.length <= BOARD_VIRTUALIZE_THRESHOLD ? (
+          {entries.length > 0 ? (
+            <SortableContext
+              items={sortableIds}
+              strategy={hierarchy ? noShiftStrategy : verticalListSortingStrategy}
+            >
+              {entries.length <= BOARD_VIRTUALIZE_THRESHOLD ? (
                 /* Small column: plain full render (reusing the same
                    itemContent, so it is byte-identical to the virtualized
                    rows). No handoff, no estimates — see
@@ -291,20 +398,20 @@ export const BoardColumn = memo(function BoardColumn({
                    Footer slot. */
                 <>
                   <VirtuosoSeed
-                    data={resolvedIssues}
+                    data={entries}
                     itemContent={itemContent}
                     computeItemKey={computeItemKey}
-                    count={resolvedIssues.length}
+                    count={entries.length}
                   />
                   {footer}
                 </>
               ) : scrollEl ? (
                 <Virtuoso
                   customScrollParent={scrollEl}
-                  data={resolvedIssues}
+                  data={entries}
                   computeItemKey={computeItemKey}
                   initialScrollTop={restoredScrollTop}
-                  initialItemCount={Math.min(resolvedIssues.length, BOARD_SEED_COUNT)}
+                  initialItemCount={Math.min(entries.length, BOARD_SEED_COUNT)}
                   defaultItemHeight={BOARD_CARD_ESTIMATED_HEIGHT}
                   increaseViewportBy={{ top: 300, bottom: 300 }}
                   components={footerComponents}
@@ -317,7 +424,7 @@ export const BoardColumn = memo(function BoardColumn({
                    with a matching `initialItemCount` to survive the
                    measurement frame (MUL-4750). */
                 <VirtuosoSeed
-                  data={resolvedIssues}
+                  data={entries}
                   itemContent={itemContent}
                   computeItemKey={computeItemKey}
                   count={BOARD_SEED_COUNT}
@@ -341,6 +448,133 @@ export const BoardColumn = memo(function BoardColumn({
   );
 });
 
+const EMPTY_SET: ReadonlySet<string> = new Set();
+
+/** One card or ghost container, with its sub-issues rendered inside. */
+function BoardTreeItem({
+  node,
+  depth,
+  childProgressMap,
+  projectMap,
+  projectId,
+  sortLabel,
+  hierarchy,
+}: {
+  node: BoardTreeNode;
+  depth: number;
+  childProgressMap?: Map<string, ChildProgress>;
+  projectMap?: Map<string, Project>;
+  projectId?: string;
+  sortLabel?: string | null;
+  hierarchy?: BoardColumnHierarchy;
+}) {
+  const { t } = useT("issues");
+  const p = useWorkspacePaths();
+  const hostId = nodeIssueId(node);
+  const collapsed = hierarchy?.collapsed.has(hostId) ?? false;
+  const hasChildren = !!hierarchy && node.children.length > 0;
+  const countLabel = t(($) => $.board.sub_issue_count, {
+    count: node.descendantCount,
+  });
+  const chevron = collapsed ? (
+    <ChevronRight className="size-3.5 shrink-0" />
+  ) : (
+    <ChevronDown className="size-3.5 shrink-0" />
+  );
+  const children =
+    hasChildren && !collapsed ? (
+      <div
+        className={`space-y-2 pb-2 ${depth + 1 < MAX_INDENT_DEPTH ? "px-2" : ""}`}
+      >
+        {node.children.map((child) => (
+          <BoardTreeItem
+            key={child.key}
+            node={child}
+            depth={depth + 1}
+            childProgressMap={childProgressMap}
+            projectMap={projectMap}
+            projectId={projectId}
+            sortLabel={sortLabel}
+            hierarchy={hierarchy}
+          />
+        ))}
+      </div>
+    ) : null;
+
+  if (node.kind === "ghost") {
+    const parent = node.parent;
+    return (
+      // The parent itself lives in another column (or is not on the board);
+      // this muted frame only names it so the sub-issues keep their context.
+      <div className="rounded-lg border border-dashed border-border">
+        <div className="flex min-w-0 items-center gap-1 px-1.5 py-1.5 text-caption text-muted-foreground">
+          <button
+            type="button"
+            aria-expanded={!collapsed}
+            aria-label={countLabel}
+            className="flex shrink-0 items-center rounded-sm p-0.5 transition-colors hover:bg-accent/60 hover:text-foreground"
+            onClick={() => hierarchy?.onToggle(hostId)}
+          >
+            {chevron}
+          </button>
+          <AppLink
+            href={p.issueDetail(node.parentId)}
+            newTabTitle={parent?.identifier}
+            className="flex min-w-0 items-center gap-1.5 hover:text-foreground"
+          >
+            {parent && <span className="shrink-0">{parent.identifier}</span>}
+            <span className="truncate">{parent?.title ?? "…"}</span>
+          </AppLink>
+          {collapsed && (
+            <span className="ml-auto shrink-0 tabular-nums">{node.descendantCount}</span>
+          )}
+        </div>
+        {children}
+      </div>
+    );
+  }
+
+  const { issue } = node;
+  return (
+    <DraggableBoardCard
+      issue={issue}
+      childProgress={childProgressMap?.get(issue.id)}
+      project={
+        issue.project_id && issue.project_id !== projectId
+          ? projectMap?.get(issue.project_id)
+          : undefined
+      }
+      disableSorting={!!sortLabel}
+      nested={
+        hasChildren ? (
+          <>
+            {/* Outside the card's link so the toggle is never a control
+                nested inside an anchor; buttons are also excluded from
+                board panning. */}
+            <button
+              type="button"
+              aria-expanded={!collapsed}
+              className="mx-1.5 mb-1.5 flex items-center gap-1 rounded-md px-1 py-0.5 text-caption text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+              onClick={() => hierarchy?.onToggle(hostId)}
+            >
+              {chevron}
+              {countLabel}
+            </button>
+            {children}
+          </>
+        ) : undefined
+      }
+    />
+  );
+}
+
+/** On a project board, the column's handoff for that project. (MUL-7420) */
+function WorkflowStepHandlerBadge({ status }: { status: string }) {
+  const { scopeWorkflow, scopeProject } = useBoardWorkflow();
+  if (!scopeWorkflow || !scopeProject) return null;
+  return <ColumnHandoff status={status} workflow={scopeWorkflow} project={scopeProject} />;
+}
+
 function BoardGroupHeading({
   group,
   count,
@@ -359,9 +593,11 @@ function BoardGroupHeading({
           className="size-2.5 shrink-0 rounded-full bg-muted-foreground/30"
           style={group.propertyOptionColor ? { backgroundColor: group.propertyOptionColor } : undefined}
         />
-        <span className="truncate text-body font-medium" title={group.title}>
-          {group.title}
-        </span>
+        <TruncatedTooltip content={group.title}>
+          <span className="truncate text-body font-medium">
+            {group.title}
+          </span>
+        </TruncatedTooltip>
         <span className="shrink-0 rounded-full bg-background px-1.5 py-0.5 text-micro font-medium tabular-nums text-muted-foreground">
           {count}
         </span>
@@ -379,9 +615,11 @@ function BoardGroupHeading({
             <FolderMinus className="size-3.5" />
           </span>
         )}
-        <span className="truncate text-body font-medium" title={group.title}>
-          {group.title}
-        </span>
+        <TruncatedTooltip content={group.title}>
+          <span className="truncate text-body font-medium">
+            {group.title}
+          </span>
+        </TruncatedTooltip>
         <span className="shrink-0 rounded-full bg-background px-1.5 py-0.5 text-micro font-medium tabular-nums text-muted-foreground">
           {count}
         </span>
@@ -406,9 +644,11 @@ function BoardGroupHeading({
   return (
     <div className="flex min-w-0 items-center gap-2">
       {actorIcon}
-      <span className="truncate text-body font-medium" title={group.title}>
-        {group.title}
-      </span>
+      <TruncatedTooltip content={group.title}>
+        <span className="truncate text-body font-medium">
+          {group.title}
+        </span>
+      </TruncatedTooltip>
       <span className="shrink-0 rounded-full bg-background px-1.5 py-0.5 text-micro font-medium tabular-nums text-muted-foreground">
         {count}
       </span>

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, memo } from "react";
+import { useCallback, memo, type ReactNode } from "react";
 import { AppLink } from "../../navigation";
 import { useSortable, defaultAnimateLayoutChanges } from "@dnd-kit/sortable";
 import type { AnimateLayoutChanges } from "@dnd-kit/sortable";
@@ -12,7 +12,7 @@ import { propertyListOptions } from "@multica/core/properties";
 import { CustomPropertyValueDisplay } from "./pickers/custom-property-picker";
 import { descriptionPreview } from "./description-preview";
 import { formatDateOnly, isPastDateOnly } from "@multica/core/issues/date";
-import { CalendarClock, CalendarDays } from "lucide-react";
+import { CalendarClock, CalendarDays } from "@multica/ui/icons";
 import { ActorAvatar } from "../../common/actor-avatar";
 import { PropertyIcon } from "../../common/property-icon";
 import { useWorkspacePaths } from "@multica/core/paths";
@@ -59,11 +59,14 @@ export const BoardCardContent = memo(function BoardCardContent({
   editable = false,
   childProgress,
   project,
+  framed = true,
 }: {
   issue: Issue;
   editable?: boolean;
   childProgress?: ChildProgress;
   project?: Project;
+  /** False when an outer card frame (one hosting sub-issues) draws the border. */
+  framed?: boolean;
 }) {
   const { t } = useT("issues");
   const locale = useLocale();
@@ -133,6 +136,7 @@ export const BoardCardContent = memo(function BoardCardContent({
         <PriorityPicker
           priority={issue.priority}
           onUpdate={handleUpdate}
+          tooltip={priorityLabel}
           triggerRender={
             <button
               type="button"
@@ -197,7 +201,17 @@ export const BoardCardContent = memo(function BoardCardContent({
   const showRightMeta = !!showStartDate || !!showDueDate || !!showChildProgress || showUpdatedHint;
 
   return (
-    <div className="rounded-lg border-[0.5px] border-surface-border bg-surface py-3 px-2.5 shadow-[var(--surface-shadow)] transition-colors group-hover/card:border-foreground/15 group-hover/card:bg-surface-hover group-data-[popup-open]/card:border-foreground/15 group-data-[popup-open]/card:bg-surface-hover group-data-[peeked]/card:ring-2 group-data-[peeked]/card:ring-brand/50">
+    <div
+      data-mc="board-card"
+      data-status={issue.status}
+      data-priority={issue.priority}
+      data-assignee-type={issue.assignee_type ?? "none"}
+      className={
+        framed
+          ? "rounded-board-card border-[0.5px] border-board-card-border bg-board-card py-3 px-2.5 shadow-[var(--board-card-shadow,var(--surface-shadow))] transition-colors group-hover/card:border-foreground/15 group-hover/card:bg-board-card-hover group-data-[popup-open]/card:border-foreground/15 group-data-[popup-open]/card:bg-board-card-hover group-data-[peeked]/card:ring-2 group-data-[peeked]/card:ring-brand/50"
+          : "rounded-t-board-card py-3 px-2.5 transition-colors group-hover/card:bg-board-card-hover group-data-[peeked]/card:bg-board-card-hover"
+      }
+    >
       {/* Row 1: priority + identifier (left), agent activity + assignee (right) */}
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-1.5 min-w-0">
@@ -209,7 +223,7 @@ export const BoardCardContent = memo(function BoardCardContent({
       </div>
 
       {/* Row 2: Title */}
-      <p className="mt-1 text-body font-medium leading-snug line-clamp-2">
+      <p className="mt-1 text-body font-medium leading-snug cjk:leading-normal line-clamp-2">
         {issue.title}
       </p>
 
@@ -271,6 +285,7 @@ export const BoardCardContent = memo(function BoardCardContent({
                     <StartDatePicker
                       startDate={issue.start_date}
                       onUpdate={handleUpdate}
+                      tooltip={t(($) => $.detail.prop_start_date)}
                       trigger={
                         <span className="flex items-center gap-1 text-caption text-muted-foreground">
                           <CalendarClock className="size-3" />
@@ -292,6 +307,7 @@ export const BoardCardContent = memo(function BoardCardContent({
                     <DueDatePicker
                       dueDate={issue.due_date}
                       onUpdate={handleUpdate}
+                      tooltip={t(($) => $.detail.prop_due_date)}
                       trigger={
                         <span
                           className={`flex items-center gap-1 text-caption ${
@@ -351,11 +367,17 @@ export const DraggableBoardCard = memo(function DraggableBoardCard({
   childProgress,
   project,
   disableSorting,
+  nested,
 }: {
   issue: Issue;
   childProgress?: ChildProgress;
   project?: Project;
   disableSorting?: boolean;
+  /**
+   * Sub-issues rendered inside this card's frame, below its own content and
+   * outside its link so no card or control is nested inside an anchor.
+   */
+  nested?: ReactNode;
 }) {
   const p = useWorkspacePaths();
   const peek = useIssuePeekActions();
@@ -380,6 +402,23 @@ export const DraggableBoardCard = memo(function DraggableBoardCard({
     transition,
   };
 
+  const link = (
+    <AppLink
+      href={p.issueDetail(issue.id)}
+      newTabTitle={issue.identifier}
+      className={`group block transition-colors ${isDragging ? "pointer-events-none" : ""}`}
+      {...peekLinkProps}
+    >
+      <BoardCardContent
+        issue={issue}
+        editable
+        childProgress={childProgress}
+        project={project}
+        framed={!nested}
+      />
+    </AppLink>
+  );
+
   return (
     <IssueActionsContextMenu issue={issue}>
       <div
@@ -387,13 +426,15 @@ export const DraggableBoardCard = memo(function DraggableBoardCard({
         style={style}
         data-board-card=""
         {...{ [PEEK_TARGET_ATTR]: issue.id }}
-        data-peeked={peeked ? "" : undefined}
+        data-peeked={peeked && !nested ? "" : undefined}
         {...attributes}
         {...listeners}
-        className={`group/card ${isDragging ? "opacity-30" : ""}`}
+        className={`${nested ? "" : "group/card"} ${isDragging ? "opacity-30" : ""}`}
         onKeyDown={
           peek
             ? (e) => {
+                // A nested sub-issue card already handled this Space press.
+                if (e.defaultPrevented) return;
                 // Space peeks the focused card (the card itself or its link,
                 // never a picker button inside it). The board registers no
                 // keyboard drag sensor, so Space is free here.
@@ -405,19 +446,22 @@ export const DraggableBoardCard = memo(function DraggableBoardCard({
             : undefined
         }
       >
-        <AppLink
-          href={p.issueDetail(issue.id)}
-          newTabTitle={issue.identifier}
-          className={`group block transition-colors ${isDragging ? "pointer-events-none" : ""}`}
-          {...peekLinkProps}
-        >
-          <BoardCardContent
-            issue={issue}
-            editable
-            childProgress={childProgress}
-            project={project}
-          />
-        </AppLink>
+        {nested ? (
+          <div className="rounded-board-card border-[0.5px] border-board-card-border bg-board-card shadow-[var(--board-card-shadow,var(--surface-shadow))]">
+            {/* Hover and peek styling stay on this card's own section, so
+                hovering a nested sub-issue does not light up the parent. */}
+            <div className="group/card" data-peeked={peeked ? "" : undefined}>
+              {link}
+            </div>
+            {/* A right-click belongs to the innermost card; stop it here so
+                the hosting card does not reopen the menu for itself. */}
+            <div onContextMenu={(e) => e.stopPropagation()}>
+              {nested}
+            </div>
+          </div>
+        ) : (
+          link
+        )}
       </div>
     </IssueActionsContextMenu>
   );

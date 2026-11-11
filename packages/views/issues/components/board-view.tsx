@@ -4,7 +4,7 @@ import { useIssueStatuses } from "@multica/core/issue-statuses/hooks";
 import { cn } from "@multica/ui/lib/utils";
 
 import { useState, useCallback, useMemo, useEffect, useRef, memo } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQueries, useQuery } from "@tanstack/react-query";
 import {
   DndContext,
   DragOverlay,
@@ -30,9 +30,26 @@ import { propertyListOptions, useSetIssueProperty, useUnsetIssueProperty } from 
 import { useWorkspaceId } from "@multica/core/hooks";
 import type { IssueGrouping } from "@multica/core/issues/stores/view-store";
 import { useActorName } from "@multica/core/workspace/hooks";
-import { BoardColumn, BOARD_CARD_WIDTH, type BoardColumnGroup } from "./board-column";
+import { issueDetailOptions } from "@multica/core/issues/queries";
+import {
+  BoardColumn,
+  BOARD_CARD_WIDTH,
+  type BoardColumnGroup,
+  type BoardColumnHierarchy,
+} from "./board-column";
+import { BoardWorkflowContext, type BoardWorkflowContextValue } from "./board-workflow-context";
+import {
+  issueStatusWorkflow,
+  resolveProjectWorkflow,
+  stepHandsOff,
+  useIssueWorkflows,
+  workflowAllowsStatus,
+  workflowStep,
+} from "@multica/core/issue-workflows";
+import { WorkflowHandoffConfirmDialog } from "../../workflows/handoff-confirm-dialog";
+import { stepHandlerActor, useStepHandlerLabel } from "../../workflows/step-handler";
+import { projectListOptions } from "@multica/core/projects/queries";
 import { BoardCardContent } from "./board-card";
-import { HiddenColumnsPanel, HiddenColumnRow } from "./hidden-columns-panel";
 import { InfiniteScrollSentinel } from "./infinite-scroll-sentinel";
 import { ListLoadMoreFooter } from "./list-load-more-footer";
 import type { ChildProgress } from "./list-row";
@@ -47,6 +64,7 @@ import type {
 } from "../surface/use-issue-group-branches";
 import { useDragSettle } from "./use-drag-settle";
 import { useIssuePeekActions } from "../surface/peek-context";
+import { useIssueSurfaceActionsOptional } from "../surface/actions-context";
 import { useBoardDragPan } from "./use-board-drag-pan";
 import { useT } from "../../i18n";
 import {
@@ -64,6 +82,13 @@ import {
   propertyGroupId,
   projectGroupId,
 } from "../utils/drag-utils";
+import {
+  buildBoardColumnTree,
+  nestedIssueIds,
+  siblingIds,
+  visibleTreeIssueIds,
+} from "../utils/board-hierarchy";
+import { useStatusLabel } from "../utils/status-label";
 
 function isStatusGroup(
   group: BoardColumnGroup,
@@ -249,7 +274,6 @@ const EMPTY_IDS: string[] = [];
 function BoardViewImpl({
   issues,
   visibleStatuses,
-  hiddenStatuses,
   onMoveIssue,
   childProgressMap = EMPTY_PROGRESS_MAP,
   projectMap,
@@ -260,7 +284,6 @@ function BoardViewImpl({
 }: {
   issues: Issue[];
   visibleStatuses: IssueStatus[];
-  hiddenStatuses: IssueStatus[];
   onMoveIssue: (issueId: string, updates: DragMoveUpdates, onSettled?: () => void) => void;
   childProgressMap?: Map<string, ChildProgress>;
   projectMap?: Map<string, Project>;
@@ -275,6 +298,7 @@ function BoardViewImpl({
   const sortBy = useViewStore((s) => s.sortBy);
   const boardWsId = useWorkspaceId();
   const catalog = useIssueStatuses(boardWsId);
+  const labelOf = useStatusLabel(boardWsId);
   const { data: workspaceProperties = [] } = useQuery(propertyListOptions(boardWsId));
   const groupingPropertyId = propertyIdFromViewKey(storeGrouping);
   const groupingProperty = groupingPropertyId
@@ -470,8 +494,119 @@ function BoardViewImpl({
     [groupIds],
   );
 
+  // --- Issue map ---
+  // Frozen during drag so BoardColumn/DraggableBoardCard props stay
+  // referentially stable even if a TQ refetch lands mid-drag.
+  const issueMap = useMemo(() => {
+    const map = new Map<string, Issue>();
+    for (const issue of groupedIssues) map.set(issue.id, issue);
+    return map;
+  }, [groupedIssues]);
+
+  // --- Sub-issue nesting ---
+  // Sub-issues render inside their parent's card. A parent outside a column
+  // still frames its sub-issues there, so a parent that is not loaded on the
+  // board at all (a hidden column, another page, a filter) is fetched for its
+  // title.
+  const boardHierarchy = useViewStore((s) => s.boardHierarchy);
+  const boardCollapsedParents = useViewStore((s) => s.boardCollapsedParents);
+  const toggleBoardParentCollapsed = useViewStore((s) => s.toggleBoardParentCollapsed);
+  const collapsedParentSet = useMemo(
+    () => new Set(boardCollapsedParents),
+    [boardCollapsedParents],
+  );
+  const missingParentIds = useMemo(() => {
+    if (!boardHierarchy) return [];
+    const ids = new Set<string>();
+    for (const issue of groupedIssues) {
+      const parentId = issue.parent_issue_id;
+      if (parentId && !issueMap.has(parentId)) ids.add(parentId);
+    }
+    return Array.from(ids).sort();
+  }, [boardHierarchy, groupedIssues, issueMap]);
+  const missingParents = useQueries({
+    queries: missingParentIds.map((id) => issueDetailOptions(boardWsId, id)),
+    combine: (results) => results.map((result) => result.data),
+  });
+  const lookupParent = useMemo(() => {
+    const fetched = new Map<string, Issue>();
+    for (const parent of missingParents) {
+      if (parent) fetched.set(parent.id, parent);
+    }
+    return (id: string) => fetched.get(id);
+  }, [missingParents]);
+  const columnHierarchy = useMemo(
+    () =>
+      boardHierarchy
+        ? {
+            collapsed: collapsedParentSet,
+            onToggle: toggleBoardParentCollapsed,
+            lookupParent,
+          }
+        : undefined,
+    [boardHierarchy, collapsedParentSet, toggleBoardParentCollapsed, lookupParent],
+  );
+  // Columns keep the server order; nesting is derived when rendering.
+  const buildBoardColumns = useCallback(
+    () => buildColumns(groupedIssues, groups, grouping, groupingOptionIds),
+    [groupedIssues, groups, grouping, groupingOptionIds],
+  );
+
   // --- Drag state ---
   const [activeIssue, setActiveIssue] = useState<Issue | null>(null);
+  const [pendingHandoff, setPendingHandoff] = useState<{
+    issue: Issue;
+    status: IssueStatus;
+    updates: ReturnType<typeof getMoveUpdates>;
+    anchors: ReturnType<typeof getMoveAnchors>;
+  } | null>(null);
+
+  // Project workflows (MUL-7420): a card can only move to a status its
+  // project's workflow lists, and a project board names each step's handler.
+  const { workflows } = useIssueWorkflows(boardWsId);
+  const { data: workspaceProjects } = useQuery(projectListOptions(boardWsId));
+  const workflowOfIssue = useCallback(
+    (issue: Issue | null | undefined) => {
+      if (!issue?.project_id) return null;
+      return resolveProjectWorkflow(
+        workflows,
+        workspaceProjects?.find((p) => p.id === issue.project_id),
+      );
+    },
+    [workflows, workspaceProjects],
+  );
+  // Which statuses a card may move to: its project's workflow, or Default
+  // outside a project, where nothing hands off. (MUL-8250)
+  const statusWorkflowOfIssue = useCallback(
+    (issue: Issue | null | undefined) => (issue ? issueStatusWorkflow(workflows, workspaceProjects, issue) : null),
+    [workflows, workspaceProjects],
+  );
+  const scopeProject = projectId ? workspaceProjects?.find((p) => p.id === projectId) ?? null : null;
+  const activeWorkflow = workflowOfIssue(activeIssue);
+  const activeStatusWorkflow = statusWorkflowOfIssue(activeIssue);
+  const activeProject = activeIssue?.project_id
+    ? workspaceProjects?.find((p) => p.id === activeIssue.project_id) ?? null
+    : null;
+  const activeHandlerLabel = useStepHandlerLabel(activeProject);
+  const boardWorkflow = useMemo<BoardWorkflowContextValue>(
+    () => ({
+      scopeWorkflow: resolveProjectWorkflow(workflows, scopeProject),
+      scopeProject,
+      dropBlockedReason: (status) =>
+        activeStatusWorkflow && activeIssue?.status !== status && !workflowAllowsStatus(activeStatusWorkflow, status)
+          ? t(($) => $.workflows.not_in_workflow, { name: activeStatusWorkflow.name })
+          : null,
+      dropHint: (status) => {
+        if (!activeWorkflow || activeIssue?.status === status) return null;
+        const step = workflowStep(activeWorkflow, status);
+        const name = activeHandlerLabel(step);
+        if (!step || !name) return null;
+        const actor = stepHandlerActor(step, activeProject);
+        return { name, actor, run: actor ? actor.type !== "member" : step.handler.type === "creator" };
+      },
+    }),
+    [activeHandlerLabel, activeIssue?.status, activeProject, activeStatusWorkflow, activeWorkflow, scopeProject, t, workflows],
+  );
   // Shared drag/settle primitive: owns the local column mirror, the
   // dragging/settling locks, the post-move animation-frame throttle, and the
   // settle callback. Shared with list-view (and swimlane) so the surfaces
@@ -486,22 +621,13 @@ function BoardViewImpl({
     recentlyMovedRef,
     settleVersion,
     beginSettle,
-  } = useDragSettle(() => buildColumns(groupedIssues, groups, grouping, groupingOptionIds));
+  } = useDragSettle(buildBoardColumns);
 
   useEffect(() => {
     if (!isDraggingRef.current && !isSettlingRef.current) {
-      setColumns(buildColumns(groupedIssues, groups, grouping, groupingOptionIds));
+      setColumns(buildBoardColumns());
     }
-  }, [groupedIssues, groups, grouping, groupingOptionIds, settleVersion, setColumns, isDraggingRef, isSettlingRef]);
-
-  // --- Issue map ---
-  // Frozen during drag so BoardColumn/DraggableBoardCard props stay
-  // referentially stable even if a TQ refetch lands mid-drag.
-  const issueMap = useMemo(() => {
-    const map = new Map<string, Issue>();
-    for (const issue of groupedIssues) map.set(issue.id, issue);
-    return map;
-  }, [groupedIssues]);
+  }, [buildBoardColumns, settleVersion, setColumns, isDraggingRef, isSettlingRef]);
 
   const issueMapRef = useRef(issueMap);
   if (!isDraggingRef.current && !isSettlingRef.current) {
@@ -517,21 +643,47 @@ function BoardViewImpl({
   // Side peek steps through a column with J / K, in the order shown here.
   const peek = useIssuePeekActions();
   useEffect(() => {
-    peek?.publishColumns(groups.map((group) => columns[group.id] ?? EMPTY_IDS));
-  }, [peek, groups, columns]);
+    peek?.publishColumns(
+      groups.map((group) => {
+        const ids = columns[group.id] ?? EMPTY_IDS;
+        return boardHierarchy
+          ? visibleTreeIssueIds(
+              buildBoardColumnTree(ids, issueMapRef.current, lookupParent),
+              collapsedParentSet,
+            )
+          : ids;
+      }),
+    );
+  }, [peek, groups, columns, boardHierarchy, collapsedParentSet, lookupParent]);
   useEffect(() => () => peek?.publishColumns(null), [peek]);
 
   // #6700: drag empty board background with the left button to pan horizontally
   // (Trello/Linear). Card drags start on `[data-board-card]` and are ignored.
   const pan = useBoardDragPan<HTMLDivElement>();
 
+  // Sub-issues shown inside the dragged card travel with it to another
+  // column. Captured at drag start, before onDragOver re-homes the card.
+  const surfaceActions = useIssueSurfaceActionsOptional();
+  const draggedNestedIdsRef = useRef<string[]>([]);
+
   const handleDragStart = useCallback(
     (event: DragStartEvent) => {
       isDraggingRef.current = true;
-      const issue = issueMapRef.current.get(event.active.id as string) ?? null;
+      const activeId = event.active.id as string;
+      const issue = issueMapRef.current.get(activeId) ?? null;
       setActiveIssue(issue);
+      const originCol = findColumn(columnsRef.current, activeId, groupIds);
+      draggedNestedIdsRef.current =
+        boardHierarchy && originCol
+          ? nestedIssueIds(
+              columnsRef.current[originCol] ?? EMPTY_IDS,
+              issueMapRef.current,
+              lookupParent,
+              activeId,
+            )
+          : [];
     },
-    [isDraggingRef],
+    [isDraggingRef, columnsRef, groupIds, boardHierarchy, lookupParent],
   );
 
   const handleDragOver = useCallback(
@@ -548,6 +700,14 @@ function BoardViewImpl({
         if (!activeCol || !overCol || activeCol === overCol) return prev;
         const targetStatus = groups.find((group) => group.id === overCol)?.status;
         if (targetStatus && catalog.entryOf(targetStatus)?.archived_at) return prev;
+        const dragged = issueMapRef.current.get(activeId);
+        if (
+          targetStatus &&
+          dragged?.status !== targetStatus &&
+          !workflowAllowsStatus(statusWorkflowOfIssue(dragged), targetStatus)
+        ) {
+          return prev;
+        }
 
         if (sortBy !== "position") return prev;
 
@@ -560,7 +720,7 @@ function BoardViewImpl({
         return { ...prev, [activeCol]: oldIds, [overCol]: newIds };
       });
     },
-    [groupIds, groups, catalog, sortBy, recentlyMovedRef, setColumns],
+    [groupIds, groups, catalog, sortBy, recentlyMovedRef, setColumns, statusWorkflowOfIssue],
   );
 
   const handleDragEnd = useCallback(
@@ -569,8 +729,7 @@ function BoardViewImpl({
       isDraggingRef.current = false;
       setActiveIssue(null);
 
-      const resetColumns = () =>
-        setColumns(buildColumns(groupedIssues, groups, grouping, groupingOptionIds));
+      const resetColumns = () => setColumns(buildBoardColumns());
 
       if (!over) {
         resetColumns();
@@ -615,10 +774,77 @@ function BoardViewImpl({
       }
 
       const map = issueMapRef.current;
+      // With nesting on, a card is positioned only against cards on its own
+      // level, never against another parent's nested children.
+      const levelIds = (ids: string[]) =>
+        boardHierarchy ? siblingIds(ids, activeId, map) : ids;
+      // Give the card's nested sub-issues the target column's value too. They
+      // keep their own positions, so only the grouped field is written.
+      const moveNestedSubIssues = () => {
+        const ids = draggedNestedIdsRef.current.filter((id) => {
+          const issue = map.get(id);
+          return !!issue && !issueMatchesGroup(issue, finalGroup);
+        });
+        draggedNestedIdsRef.current = [];
+        if (ids.length === 0) return;
+        const moving = new Set(ids);
+        setColumns((prev) => {
+          const next: Record<string, string[]> = {};
+          for (const [columnId, columnIds] of Object.entries(prev)) {
+            next[columnId] = columnIds.filter((id) => !moving.has(id));
+          }
+          let target = next[finalGroup.id] ?? [];
+          for (const id of ids) {
+            target = insertIdByPosition(target, id, map.get(id)!.position, map);
+          }
+          next[finalGroup.id] = target;
+          return next;
+        });
+        if (finalGroup.propertyId !== undefined) {
+          for (const id of ids) applyPropertyGroupValue(finalGroup, id);
+          return;
+        }
+        const { position: _position, ...groupUpdates } = getMoveUpdates(finalGroup, 0);
+        surfaceActions?.batchUpdate(ids, groupUpdates).catch((err: unknown) => {
+          toast.error(
+            err instanceof Error && err.message
+              ? err.message
+              : t(($) => $.page.move_failed),
+          );
+        });
+      };
       if (finalGroup.status && map.get(activeId)?.status !== finalGroup.status && catalog.entryOf(finalGroup.status)?.archived_at) {
         resetColumns();
         return;
       }
+      const movingWorkflow = workflowOfIssue(map.get(activeId));
+      const movingStatusWorkflow = statusWorkflowOfIssue(map.get(activeId));
+      if (
+        finalGroup.status &&
+        movingStatusWorkflow &&
+        map.get(activeId)?.status !== finalGroup.status &&
+        !workflowAllowsStatus(movingStatusWorkflow, finalGroup.status)
+      ) {
+        resetColumns();
+        toast.info(
+          t(($) => $.workflows.drop_blocked, {
+            status: labelOf(finalGroup.status),
+            name: movingStatusWorkflow.name,
+          }),
+        );
+        return;
+      }
+
+      // Entering a step that hands the issue off is confirmed first: who it
+      // goes to, the previous agent's run, and the brief. The card returns to
+      // its column until then. (MUL-7420)
+      const handoffTarget =
+        finalGroup.status &&
+        movingWorkflow &&
+        map.get(activeId)?.status !== finalGroup.status &&
+        stepHandsOff(workflowStep(movingWorkflow, finalGroup.status))
+          ? finalGroup.status
+          : null;
 
       if (sortBy !== "position") {
         // Cross-column: only update group (status/assignee), keep original position.
@@ -630,6 +856,19 @@ function BoardViewImpl({
               id: "issue-manual-reorder-hint",
             });
           }
+          return;
+        }
+        if (handoffTarget) {
+          resetColumns();
+          setPendingHandoff({
+            issue: currentIssue,
+            status: handoffTarget,
+            updates: getMoveUpdates(finalGroup, currentIssue.position, currentIssue),
+            anchors: getMoveAnchors(
+              insertIdByPosition((cols[overCol] ?? []).filter((id) => id !== activeId), activeId, currentIssue.position, map),
+              activeId,
+            ),
+          });
           return;
         }
         // Optimistically move the card into the target column *now*. Without
@@ -653,15 +892,16 @@ function BoardViewImpl({
           activeId,
           {
             ...getMoveUpdates(finalGroup, currentIssue.position, currentIssue),
-            ...getMoveAnchors(targetIds, activeId),
+            ...getMoveAnchors(levelIds(targetIds), activeId),
           },
           beginSettle(),
         );
         applyPropertyGroupValue(finalGroup, activeId);
+        moveNestedSubIssues();
         return;
       }
 
-      const finalIds = finalColumns[finalCol]!;
+      const finalIds = levelIds(finalColumns[finalCol]!);
       const newPosition = computePosition(finalIds, activeId, map);
       const currentIssue = map.get(activeId);
 
@@ -670,6 +910,17 @@ function BoardViewImpl({
         issueMatchesGroup(currentIssue, finalGroup) &&
         currentIssue.position === newPosition
       ) {
+        return;
+      }
+
+      if (handoffTarget && currentIssue) {
+        resetColumns();
+        setPendingHandoff({
+          issue: currentIssue,
+          status: handoffTarget,
+          updates: getMoveUpdates(finalGroup, newPosition, currentIssue),
+          anchors: getMoveAnchors(finalIds, activeId),
+        });
         return;
       }
 
@@ -687,8 +938,11 @@ function BoardViewImpl({
         beginSettle(),
       );
       applyPropertyGroupValue(finalGroup, activeId);
+      if (currentIssue && !issueMatchesGroup(currentIssue, finalGroup)) {
+        moveNestedSubIssues();
+      }
     },
-    [groupedIssues, groups, grouping, groupingOptionIds, onMoveIssue, groupIds, groupMap, sortBy, beginSettle, columnsRef, isDraggingRef, setColumns, applyPropertyGroupValue, catalog, t],
+    [buildBoardColumns, boardHierarchy, onMoveIssue, groupIds, groupMap, sortBy, beginSettle, columnsRef, isDraggingRef, setColumns, applyPropertyGroupValue, surfaceActions, catalog, labelOf, t, workflowOfIssue, statusWorkflowOfIssue],
   );
 
   // An aborted drag (pointercancel, window resize, tab hide, Escape) fires
@@ -698,10 +952,11 @@ function BoardViewImpl({
   const handleDragCancel = useCallback(() => {
     isDraggingRef.current = false;
     setActiveIssue(null);
-    setColumns(buildColumns(groupedIssues, groups, grouping, groupingOptionIds));
-  }, [groupedIssues, groups, grouping, groupingOptionIds, setColumns, isDraggingRef]);
+    setColumns(buildBoardColumns());
+  }, [buildBoardColumns, setColumns, isDraggingRef]);
 
   return (
+    <BoardWorkflowContext.Provider value={boardWorkflow}>
     <DndContext
       sensors={sensors}
       collisionDetection={collisionDetection}
@@ -753,6 +1008,7 @@ function BoardViewImpl({
                 projectId={projectId}
                 onCreateIssue={onCreateIssue}
                 sortLabel={sortLabel}
+                hierarchy={columnHierarchy}
               />
             ) : (
               groupPagination?.[group.id] ? (
@@ -767,6 +1023,7 @@ function BoardViewImpl({
                   projectId={projectId}
                   onCreateIssue={onCreateIssue}
                   sortLabel={sortLabel}
+                  hierarchy={columnHierarchy}
                 />
               ) : (
                 <BoardColumn
@@ -780,6 +1037,7 @@ function BoardViewImpl({
                   onCreateIssue={onCreateIssue}
                   totalCount={group.totalCount}
                   sortLabel={sortLabel}
+                  hierarchy={columnHierarchy}
                 />
               )
             ),
@@ -792,14 +1050,6 @@ function BoardViewImpl({
               loading={groupBranches.isLoadingMoreGroups}
             />
           </div>
-        )}
-
-
-        {grouping === "status" && hiddenStatuses.length > 0 && (
-          <BoardHiddenColumnsPanel
-            hiddenStatuses={hiddenStatuses}
-            statusPagination={statusPagination}
-          />
         )}
       </div>
 
@@ -819,6 +1069,26 @@ function BoardViewImpl({
         ) : null}
       </DragOverlay>
     </DndContext>
+    <WorkflowHandoffConfirmDialog
+      issue={pendingHandoff?.issue ?? null}
+      toStatus={pendingHandoff?.status ?? ""}
+      onCancel={() => setPendingHandoff(null)}
+      onConfirm={({ stopPreviousRuns }) => {
+        const pending = pendingHandoff;
+        setPendingHandoff(null);
+        if (!pending) return;
+        onMoveIssue(
+          pending.issue.id,
+          {
+            ...pending.updates,
+            ...pending.anchors,
+            ...(stopPreviousRuns ? { stop_previous_assignee_runs: true } : {}),
+          },
+          beginSettle(),
+        );
+      }}
+    />
+    </BoardWorkflowContext.Provider>
   );
 }
 
@@ -833,6 +1103,7 @@ const ServerPaginatedBoardColumn = memo(function ServerPaginatedBoardColumn({
   projectId,
   onCreateIssue,
   sortLabel,
+  hierarchy,
 }: {
   group: BoardColumnGroup;
   issueIds: string[];
@@ -843,6 +1114,7 @@ const ServerPaginatedBoardColumn = memo(function ServerPaginatedBoardColumn({
   projectId?: string;
   onCreateIssue?: (defaults: IssueCreateDefaults) => void;
   sortLabel?: string | null;
+  hierarchy?: BoardColumnHierarchy;
 }) {
   const footer = page ? (
     <ListLoadMoreFooter
@@ -866,31 +1138,11 @@ const ServerPaginatedBoardColumn = memo(function ServerPaginatedBoardColumn({
       onCreateIssue={onCreateIssue}
       sortLabel={sortLabel}
       footer={footer}
+      hierarchy={hierarchy}
     />
   );
 });
 
-
-function BoardHiddenColumnsPanel({
-  hiddenStatuses,
-  statusPagination,
-}: {
-  hiddenStatuses: IssueStatus[];
-  statusPagination?: IssueStatusPagination;
-}) {
-  return (
-    <HiddenColumnsPanel
-      hiddenStatuses={hiddenStatuses}
-      renderRow={(status) => (
-        <HiddenColumnRow
-          key={status}
-          status={status}
-          total={statusPagination?.[status]?.total}
-        />
-      )}
-    />
-  );
-}
 
 /**
  * Memoized: the surface controller re-renders on loading-flag flips (e.g. a
