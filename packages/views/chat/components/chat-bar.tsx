@@ -1,8 +1,11 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion, useIsPresent } from "motion/react";
 import { useQuery } from "@tanstack/react-query";
+import { useReducedMotion } from "@multica/core/appearance";
 import { Loader2, X } from "@multica/ui/icons";
+import { UI_EASE_IN, UI_EASE_OUT, UI_MOTION_DURATION } from "@multica/ui/lib/motion";
 import { useChatStore } from "@multica/core/chat";
 import { chatSessionsOptions, pendingChatTasksOptions } from "@multica/core/chat/queries";
 import { useWorkspaceId } from "@multica/core/hooks";
@@ -16,6 +19,7 @@ import {
 } from "@multica/ui/components/ui/dropdown-menu";
 import { STAR_STROKE, starPath } from "@multica/ui/lib/multica-brand";
 import { cn } from "@multica/ui/lib/utils";
+import { ActionShortcutKeycaps } from "../../common/shortcut-keycaps";
 import { useT } from "../../i18n";
 import { BOTTOM_BAR_ITEM_CLASS } from "../../layout/bottom-bar-styles";
 import { ChatBarHistory } from "./chat-bar-history";
@@ -80,6 +84,81 @@ function SessionMark({ item }: { item: ChatBarSession }) {
 }
 
 /**
+ * One chat chip. It clips only while it grows or shrinks, so the focus rings
+ * of its buttons show once it has settled, and it ignores the pointer while
+ * it leaves.
+ */
+function ChatBarChip({
+  item,
+  title,
+  state,
+  closeLabel,
+  onToggle,
+  onClose,
+}: {
+  item: ChatBarSession;
+  title: string;
+  state: string | null;
+  closeLabel: string;
+  onToggle: () => void;
+  onClose: () => void;
+}) {
+  const reduceMotion = useReducedMotion();
+  const isPresent = useIsPresent();
+  return (
+    <motion.span
+      inert={!isPresent}
+      initial={reduceMotion ? false : { opacity: 0, width: 0, scale: 0.95, overflow: "hidden" }}
+      animate={{
+        opacity: 1,
+        width: "auto",
+        scale: 1,
+        transition: { duration: reduceMotion ? 0 : UI_MOTION_DURATION.fast, ease: UI_EASE_OUT },
+        transitionEnd: { overflow: "visible" },
+      }}
+      exit={
+        reduceMotion
+          ? { opacity: 0, transition: { duration: 0 } }
+          : {
+              opacity: 0,
+              width: 0,
+              scale: 0.95,
+              overflow: "hidden",
+              transition: { duration: UI_MOTION_DURATION.micro, ease: UI_EASE_IN },
+            }
+      }
+      className={cn("group/chip relative flex shrink-0", !isPresent && "pointer-events-none")}
+    >
+      <TooltipHint label={state ? `${title} · ${state}` : title}>
+        <button
+          type="button"
+          data-chat-anchor={item.session.id}
+          aria-pressed={item.open}
+          aria-label={state ? `${title}, ${state}` : title}
+          onClick={onToggle}
+          className={cn(BOTTOM_BAR_ITEM_CLASS, "gap-1 pl-1.5")}
+        >
+          <SessionMark item={item} />
+          {/* The close button sits over the end of the title rather than
+              beside it, so showing it never changes the chip's width. */}
+          <span className="max-w-32 truncate group-focus-within/chip:[mask-image:linear-gradient(to_right,black_calc(100%-26px),transparent_calc(100%-14px))] group-hover/chip:[mask-image:linear-gradient(to_right,black_calc(100%-26px),transparent_calc(100%-14px))]">
+            {title}
+          </span>
+        </button>
+      </TooltipHint>
+      <button
+        type="button"
+        aria-label={closeLabel}
+        onClick={onClose}
+        className="absolute top-1 right-1 flex size-4 cursor-pointer items-center justify-center rounded-sm text-muted-foreground opacity-0 outline-none transition-opacity hover:bg-surface-hover hover:text-foreground focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-ring group-hover/chip:opacity-100 motion-reduce:transition-none [&_svg]:size-3"
+      >
+        <X aria-hidden />
+      </button>
+    </motion.span>
+  );
+}
+
+/**
  * Quick chat in the bottom bar: a chip per chat that needs watching or was
  * opened here, then Ask Multica, which starts a new chat, and the history.
  * The chat window opens above whichever control is pressed:
@@ -92,13 +171,12 @@ export function ChatBar() {
   const isOpen = useChatStore((s) => s.isOpen);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const selectedAgentId = useChatStore((s) => s.selectedAgentId);
-  const quickChatAgentId = useChatStore((s) => s.quickChatAgentId);
   const kept = useChatStore((s) => s.chatBarKept);
   const dismissed = useChatStore((s) => s.chatBarDismissed);
   const setOpen = useChatStore((s) => s.setOpen);
   const setActiveSession = useChatStore((s) => s.setActiveSession);
   const setSelectedAgentId = useChatStore((s) => s.setSelectedAgentId);
-  const setSelectedProjectId = useChatStore((s) => s.setSelectedProjectId);
+  const startNewChat = useChatStore((s) => s.startNewChat);
   const keepChatInBar = useChatStore((s) => s.keepChatInBar);
   const dismissChatFromBar = useChatStore((s) => s.dismissChatFromBar);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -149,14 +227,8 @@ export function ChatBar() {
   };
 
   const askMultica = () => {
-    if (askPressed) {
-      setOpen(false);
-      return;
-    }
-    if (quickChatAgentId) setSelectedAgentId(quickChatAgentId);
-    setSelectedProjectId(null);
-    setActiveSession(null);
-    setOpen(true);
+    if (askPressed) setOpen(false);
+    else startNewChat();
   };
 
   const titleOf = (session: ChatSession) => session.title || t(($) => $.window.untitled);
@@ -167,39 +239,23 @@ export function ChatBar() {
 
   return (
     <div ref={rootRef} data-slot="chat-bar" className="flex min-w-0 shrink-0 items-center gap-0.5">
-      {visible.map((item) => {
-        const title = titleOf(item.session);
-        const state = stateOf(item);
-        return (
-          <span key={item.session.id} className="group/chip relative flex shrink-0">
-            <TooltipHint label={state ? `${title} · ${state}` : title}>
-              <button
-                type="button"
-                data-chat-anchor={item.session.id}
-                aria-pressed={item.open}
-                aria-label={state ? `${title}, ${state}` : title}
-                onClick={() => toggleSession(item.session)}
-                className={cn(BOTTOM_BAR_ITEM_CLASS, "gap-1 pl-1.5")}
-              >
-                <SessionMark item={item} />
-                {/* The close button sits over the end of the title rather than
-                    beside it, so showing it never changes the chip's width. */}
-                <span className="max-w-32 truncate group-focus-within/chip:[mask-image:linear-gradient(to_right,black_calc(100%-26px),transparent_calc(100%-14px))] group-hover/chip:[mask-image:linear-gradient(to_right,black_calc(100%-26px),transparent_calc(100%-14px))]">
-                  {title}
-                </span>
-              </button>
-            </TooltipHint>
-            <button
-              type="button"
-              aria-label={t(($) => $.bar.close_chip, { title })}
-              onClick={() => closeChip(item)}
-              className="absolute top-1 right-1 flex size-4 cursor-pointer items-center justify-center rounded-sm text-muted-foreground opacity-0 outline-none transition-opacity hover:bg-surface-hover hover:text-foreground focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-ring group-hover/chip:opacity-100 [&_svg]:size-3"
-            >
-              <X aria-hidden />
-            </button>
-          </span>
-        );
-      })}
+      <AnimatePresence initial={false}>
+        {visible.map((item) => {
+          const title = titleOf(item.session);
+          const state = stateOf(item);
+          return (
+            <ChatBarChip
+              key={item.session.id}
+              item={item}
+              title={title}
+              state={state}
+              closeLabel={t(($) => $.bar.close_chip, { title })}
+              onToggle={() => toggleSession(item.session)}
+              onClose={() => closeChip(item)}
+            />
+          );
+        })}
+      </AnimatePresence>
       {overflow.length > 0 && (
         <DropdownMenu>
           <DropdownMenuTrigger
@@ -227,7 +283,10 @@ export function ChatBar() {
       {(visible.length > 0 || overflow.length > 0) && (
         <span aria-hidden className="mx-1.5 h-3.5 w-px shrink-0 bg-surface-border" />
       )}
-      <TooltipHint label={t(($) => $.window.new_chat_tooltip)}>
+      <TooltipHint
+        label={t(($) => $.window.new_chat_tooltip)}
+        shortcut={<ActionShortcutKeycaps action="newChat" />}
+      >
         <button
           type="button"
           data-chat-anchor="new"
